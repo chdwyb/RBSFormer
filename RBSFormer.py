@@ -2,14 +2,14 @@ import torch
 import torch.nn as nn
 
 
-class FeedForward(nn.Module):
-    def __init__(self, dim, mlp_ratio=4):
+class EFFN(nn.Module):
+    def __init__(self, dim, mlp_ratio=4, bias=False):
         super().__init__()
         hidden_features = int(dim * mlp_ratio)
         self.norm = LayerNorm(dim)
-        self.fc1 = nn.Conv2d(dim, hidden_features, 1)
-        self.dwconv = nn.Conv2d(hidden_features, hidden_features, 3, padding=1, groups=hidden_features)
-        self.fc2 = nn.Conv2d(hidden_features, dim, 1)
+        self.fc1 = nn.Conv2d(dim, hidden_features, 1, bias=bias)
+        self.dwconv = nn.Conv2d(hidden_features, hidden_features, 3, padding=1, groups=hidden_features, bias=bias)
+        self.fc2 = nn.Conv2d(hidden_features, dim, 1, bias=bias)
         self.act = nn.GELU()
 
     def forward(self, x):
@@ -23,34 +23,38 @@ class FeedForward(nn.Module):
         return x
 
 
-class Attention(nn.Module):
+class CFE(nn.Module):
     def __init__(self, dim, bias=False):
         super().__init__()
         self.norm = LayerNorm(dim)
-        self.qk = nn.Conv2d(dim, dim, 1, bias=bias)
-        self.act = nn.GELU()
-        self.dwconv = nn.Conv2d(dim, dim, 11, padding=5, groups=dim, bias=bias)
 
-        self.v = nn.Conv2d(dim, dim, 1)
-        self.proj = nn.Conv2d(dim, dim, 1)
+        self.pconv_in = nn.Conv2d(dim, dim * 2, 1, bias=bias)
+        self.dwconv = nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=1, groups=dim, bias=bias)
+        self.dwdconv = nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=7, dilation=7, groups=dim, bias=bias)
+        self.pconv_s = nn.Conv2d(dim, dim, 1, bias=bias)
+
+        self.ap = nn.AdaptiveAvgPool2d(1)
+        self.pconv_c = nn.Conv2d(dim, dim, 1, bias=bias)
+
+        self.pconv_out = nn.Conv2d(dim * 2, dim, 1, bias=bias)
 
     def forward(self, x):
         x = self.norm(x)
-        qk = self.qk(x)
-        attn = self.act(qk)
-        attn = self.dwconv(attn)
-        attn = self.act(attn)
-        v = self.v(x)
-        x = attn * v
-        x = self.proj(x)
+        x1, x2 = self.pconv_in(x).chunk(2, dim=1)
+
+        x1 = self.pconv_s(self.dwdconv(self.dwconv(x1))) * x1
+        x2 = self.pconv_c(self.ap(x2)) * x2
+
+        x = self.pconv_out(torch.cat([x1, x2], dim=1))
+
         return x
 
 
-class ConvolutionBlock(nn.Module):
+class CFEB(nn.Module):
     def __init__(self, dim, mlp_ratio=4):
         super().__init__()
-        self.attn = Attention(dim)
-        self.ffn = FeedForward(dim, mlp_ratio)
+        self.cfe = CFE(dim)
+        self.effn = EFFN(dim, mlp_ratio)
         layer_scale_init_value = 1e-6
         self.layer_scale_1 = nn.Parameter(
             layer_scale_init_value * torch.ones((dim)), requires_grad=True)
@@ -58,8 +62,8 @@ class ConvolutionBlock(nn.Module):
             layer_scale_init_value * torch.ones((dim)), requires_grad=True)
 
     def forward(self, x):
-        x = x + self.layer_scale_1.unsqueeze(-1).unsqueeze(-1) * self.attn(x)
-        x = x + self.layer_scale_2.unsqueeze(-1).unsqueeze(-1) * self.ffn(x)
+        x = x + self.layer_scale_1.unsqueeze(-1).unsqueeze(-1) * self.cfe(x)
+        x = x + self.layer_scale_2.unsqueeze(-1).unsqueeze(-1) * self.effn(x)
         return x
 
 
@@ -154,7 +158,7 @@ class Upsample(nn.Module):
         return x
 
 
-class RSFormer(nn.Module):
+class RBSFormer(nn.Module):
     def __init__(self,
                  in_channels=3,
                  dim=48,
@@ -165,39 +169,39 @@ class RSFormer(nn.Module):
                  bias=False,
                  ):
 
-        super(RSFormer, self).__init__()
+        super().__init__()
 
         self.patch_embed = PatchEmbed(in_channels, dim)
         self.encoder1 = nn.Sequential(*[
-            ConvolutionBlock(dim=dim, mlp_ratio=mlp_ratios[0]) for i in range(num_blocks[0])])
+            CFEB(dim=dim, mlp_ratio=mlp_ratios[0]) for i in range(num_blocks[0])])
 
         self.down1 = Downsample(dim, num_head=num_heads[0])
         self.encoder2 = nn.Sequential(*[
-            ConvolutionBlock(dim=int(dim * 2 ** 1), mlp_ratio=mlp_ratios[1]) for i in range(num_blocks[1])])
+            CFEB(dim=int(dim * 2 ** 1), mlp_ratio=mlp_ratios[1]) for i in range(num_blocks[1])])
 
         self.down2 = Downsample(int(dim * 2 ** 1), num_head=num_heads[1])
         self.encoder3 = nn.Sequential(*[
-            ConvolutionBlock(dim=int(dim * 2 ** 2), mlp_ratio=mlp_ratios[2]) for i in range(num_blocks[2])])
+            CFEB(dim=int(dim * 2 ** 2), mlp_ratio=mlp_ratios[2]) for i in range(num_blocks[2])])
 
         self.down3 = Downsample(int(dim * 2 ** 2), num_head=num_heads[2])
         self.latent = nn.Sequential(*[
-            ConvolutionBlock(dim=int(dim * 2 ** 3), mlp_ratio=mlp_ratios[3]) for i in range(num_blocks[3])])
+            CFEB(dim=int(dim * 2 ** 3), mlp_ratio=mlp_ratios[3]) for i in range(num_blocks[3])])
 
         self.up3 = Upsample(int(dim * 2 ** 3), num_head=num_heads[2])
         self.reduce3 = nn.Conv2d(int(dim * 2 ** 3), int(dim * 2 ** 2), kernel_size=1, bias=bias)
         self.decoder3 = nn.Sequential(*[
-            ConvolutionBlock(dim=int(dim * 2 ** 2), mlp_ratio=mlp_ratios[2]) for i in range(num_blocks[2])])
+            CFEB(dim=int(dim * 2 ** 2), mlp_ratio=mlp_ratios[2]) for i in range(num_blocks[2])])
 
         self.up2 = Upsample(int(dim * 2 ** 2), num_head=num_heads[1])
         self.reduce2 = nn.Conv2d(int(dim * 2 ** 2), int(dim * 2 ** 1), kernel_size=1, bias=bias)
         self.decoder2 = nn.Sequential(*[
-            ConvolutionBlock(dim=int(dim * 2 ** 1), mlp_ratio=mlp_ratios[1]) for i in range(num_blocks[1])])
+            CFEB(dim=int(dim * 2 ** 1), mlp_ratio=mlp_ratios[1]) for i in range(num_blocks[1])])
 
         self.up1 = Upsample(int(dim * 2 ** 1), num_head=num_heads[0])
         self.decoder1 = nn.Sequential(*[
-            ConvolutionBlock(dim=int(dim * 2 ** 1), mlp_ratio=mlp_ratios[0]) for i in range(num_blocks[0])])
+            CFEB(dim=int(dim * 2 ** 1), mlp_ratio=mlp_ratios[0]) for i in range(num_blocks[0])])
 
-        self.refinement = nn.Sequential(*[ConvolutionBlock(dim=int(dim * 2 ** 1), mlp_ratio=mlp_ratios[0]) for i in range(num_refinement_blocks)])
+        self.refinement = nn.Sequential(*[CFEB(dim=int(dim * 2 ** 1), mlp_ratio=mlp_ratios[0]) for i in range(num_refinement_blocks)])
         self.output = nn.Conv2d(int(dim * 2 ** 1), in_channels, kernel_size=3, stride=1, padding=1, bias=bias)
 
     def forward(self, x):
@@ -235,7 +239,7 @@ class RSFormer(nn.Module):
 
 if __name__ == '__main__':
     x = torch.randn((1, 3, 256, 256)).cuda()
-    net = RSFormer().cuda()
+    net = RBSFormer().cuda()
 
     from thop import profile, clever_format
     flops, params = profile(net, (x,))
